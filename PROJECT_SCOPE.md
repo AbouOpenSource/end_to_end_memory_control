@@ -10,6 +10,9 @@ full cluster or framework work:
 3. expose safe control intervals;
 4. change fast knobs online;
 5. save a CSV that can be compared with the SimGrid metrics.
+6. keep the model architecture interchangeable through a small registry, so the
+   controller can be tested against MLP, CNN, and future real backbones without
+   rewriting the training loop.
 
 The first accepted milestone is a CPU smoke test. The next milestone is a GPU
 single-process run with CUDA memory telemetry. Distributed PyTorch, FSDP, and

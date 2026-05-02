@@ -38,6 +38,13 @@ def main() -> None:
     oom_rate = oom_count / max(len(rows), 1)
 
     print(f"rows={len(rows)}")
+    if final.get("model_name"):
+        print(
+            "model="
+            f"{final.get('model_name')} "
+            f"params={final.get('model_parameters', 'unknown')} "
+            f"input_shape={final.get('model_input_shape', 'unknown')}"
+        )
     print(f"throughput_samples_per_s={throughput:.4f}")
     print(f"max_peak_mb={max_peak_mb:.2f}")
     print(f"oom_rate={oom_rate:.4f}")

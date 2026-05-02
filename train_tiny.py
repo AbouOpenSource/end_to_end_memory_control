@@ -7,9 +7,11 @@ import json
 import math
 import random
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
+
+from model_zoo import available_model_names, build_model, make_synthetic_batch
 
 
 @dataclass(frozen=True)
@@ -20,6 +22,8 @@ class RunConfig:
     input_dim: int = 256
     hidden_dim: int = 512
     num_classes: int = 10
+    model_name: str = "mlp"
+    model_args: dict[str, Any] = field(default_factory=dict)
     initial_micro_batch: int = 16
     initial_grad_accum: int = 1
     max_micro_batch: int = 64
@@ -49,10 +53,45 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--config", type=Path, default=None)
     p.add_argument("--output", type=Path, default=Path("end_to_end/out/smoke.csv"))
     p.add_argument("--controller", choices=("static", "headroom"), default=None)
+    p.add_argument("--model", choices=available_model_names(), default=None, help="Model architecture to instantiate")
+    p.add_argument(
+        "--model-arg",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Override one model_args entry, for example --model-arg hidden_dim=1024",
+    )
     p.add_argument("--steps", type=int, default=None)
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--budget-mb", type=float, default=None)
     return p.parse_args()
+
+
+def _parse_scalar(value: str) -> Any:
+    lowered = value.lower()
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def _parse_model_arg_overrides(items: list[str]) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+    for item in items:
+        if "=" not in item:
+            raise SystemExit(f"invalid --model-arg {item!r}; expected KEY=VALUE")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise SystemExit(f"invalid --model-arg {item!r}; empty key")
+        overrides[key] = _parse_scalar(value.strip())
+    return overrides
 
 
 def _build_config(args: argparse.Namespace) -> RunConfig:
@@ -60,6 +99,11 @@ def _build_config(args: argparse.Namespace) -> RunConfig:
     cfg = RunConfig(**raw)
     if args.controller is not None:
         cfg = replace(cfg, controller=args.controller)
+    if args.model is not None:
+        cfg = replace(cfg, model_name=args.model, model_args={})
+    model_arg_overrides = _parse_model_arg_overrides(args.model_arg)
+    if model_arg_overrides:
+        cfg = replace(cfg, model_args={**cfg.model_args, **model_arg_overrides})
     if args.steps is not None:
         cfg = replace(cfg, steps=int(args.steps))
     if args.device is not None:
@@ -69,10 +113,24 @@ def _build_config(args: argparse.Namespace) -> RunConfig:
     return cfg
 
 
-def _estimate_peak_mb(*, model_bytes: int, micro_batch: int, input_dim: int, hidden_dim: int) -> float:
+def _model_args_for_config(cfg: RunConfig) -> dict[str, Any]:
+    if cfg.model_args:
+        return dict(cfg.model_args)
+    if cfg.model_name in {"linear", "mlp"}:
+        args: dict[str, Any] = {
+            "input_dim": cfg.input_dim,
+            "num_classes": cfg.num_classes,
+        }
+        if cfg.model_name == "mlp":
+            args["hidden_dim"] = cfg.hidden_dim
+        return args
+    return {}
+
+
+def _estimate_peak_mb(*, model_bytes: int, micro_batch: int, activation_units_per_sample: int) -> float:
     # This CPU smoke test cannot observe CUDA VRAM. The proxy keeps the same
     # control shape as the simulator: larger micro-batches increase peak memory.
-    activation_bytes = micro_batch * (input_dim + hidden_dim + hidden_dim + 10) * 4
+    activation_bytes = micro_batch * activation_units_per_sample * 4
     optimizer_bytes = model_bytes * 2
     workspace_bytes = max(8 * 1024 * 1024, activation_bytes * 2)
     return (model_bytes + optimizer_bytes + activation_bytes + workspace_bytes) / (1024 * 1024)
@@ -123,15 +181,11 @@ def main() -> None:
     torch.manual_seed(cfg.seed)
 
     device = torch.device(cfg.device)
-    model = nn.Sequential(
-        nn.Linear(cfg.input_dim, cfg.hidden_dim),
-        nn.ReLU(),
-        nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
-        nn.ReLU(),
-        nn.Linear(cfg.hidden_dim, cfg.num_classes),
-    ).to(device)
+    model, model_profile = build_model(cfg.model_name, _model_args_for_config(cfg), nn)
+    model = model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate)
     model_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+    model_parameters = sum(p.numel() for p in model.parameters())
 
     knobs = Knobs(
         micro_batch=int(cfg.initial_micro_batch),
@@ -155,6 +209,9 @@ def main() -> None:
         "next_grad_accum_steps",
         "controller",
         "knob_changed",
+        "model_name",
+        "model_parameters",
+        "model_input_shape",
         "loss",
     ]
 
@@ -170,8 +227,7 @@ def main() -> None:
 
             compute_started = time.perf_counter()
             for _ in range(step_knobs.grad_accum_steps):
-                x = torch.randn(step_knobs.micro_batch, cfg.input_dim, device=device)
-                y = torch.randint(0, cfg.num_classes, (step_knobs.micro_batch,), device=device)
+                x, y = make_synthetic_batch(model_profile, step_knobs.micro_batch, device, torch)
                 logits = model(x)
                 loss = F.cross_entropy(logits, y) / max(1, step_knobs.grad_accum_steps)
                 loss.backward()
@@ -189,8 +245,7 @@ def main() -> None:
             peak_mb = _estimate_peak_mb(
                 model_bytes=model_bytes,
                 micro_batch=step_knobs.micro_batch,
-                input_dim=cfg.input_dim,
-                hidden_dim=cfg.hidden_dim,
+                activation_units_per_sample=model_profile.activation_units_per_sample,
             )
             oom = peak_mb > cfg.budget_mb
             comm_frac = comm_s / max(step_s, 1e-12)
@@ -222,11 +277,19 @@ def main() -> None:
                     "next_grad_accum_steps": knobs.grad_accum_steps,
                     "controller": cfg.controller,
                     "knob_changed": int(knob_changed),
+                    "model_name": model_profile.name,
+                    "model_parameters": model_parameters,
+                    "model_input_shape": "x".join(str(dim) for dim in model_profile.input_shape),
                     "loss": f"{total_loss:.6f}",
                 }
             )
 
     print(f"wrote {args.output}")
+    print(
+        "model="
+        f"{model_profile.name} params={model_parameters} "
+        f"input_shape={model_profile.input_shape} description={model_profile.description}"
+    )
 
 
 if __name__ == "__main__":

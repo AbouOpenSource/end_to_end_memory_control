@@ -2,11 +2,11 @@
   "steps": 80,
   "seed": 0,
   "device": "cpu",
-  "model_name": "mlp",
+  "model_name": "tiny_cnn",
   "model_args": {
-    "input_dim": 256,
-    "hidden_dim": 512,
-    "hidden_layers": 2,
+    "channels": 3,
+    "image_size": 32,
+    "width": 16,
     "num_classes": 10
   },
   "initial_micro_batch": 16,

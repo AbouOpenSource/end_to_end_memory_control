@@ -1,0 +1,8 @@
+.venv-e2e/
+__pycache__/
+*.pyc
+out/
+*.pt
+*.pth
+*.ckpt
+telemetry*.csv

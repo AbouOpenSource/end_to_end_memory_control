@@ -1,0 +1,17 @@
+{
+  "steps": 80,
+  "seed": 0,
+  "device": "cpu",
+  "input_dim": 256,
+  "hidden_dim": 512,
+  "num_classes": 10,
+  "initial_micro_batch": 16,
+  "initial_grad_accum": 1,
+  "max_micro_batch": 64,
+  "max_grad_accum": 32,
+  "control_interval": 10,
+  "budget_mb": 96.0,
+  "headroom_margin": 0.05,
+  "learning_rate": 0.001,
+  "controller": "headroom"
+}

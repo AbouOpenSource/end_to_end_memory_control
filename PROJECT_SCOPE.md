@@ -1,0 +1,16 @@
+# Project Scope
+
+This project is intentionally separate from `simgrid_cluster_env`.
+
+Its role is to validate the smallest real training-loop integration before any
+full cluster or framework work:
+
+1. run a PyTorch model;
+2. collect telemetry after each optimizer step;
+3. expose safe control intervals;
+4. change fast knobs online;
+5. save a CSV that can be compared with the SimGrid metrics.
+
+The first accepted milestone is a CPU smoke test. The next milestone is a GPU
+single-process run with CUDA memory telemetry. Distributed PyTorch, FSDP, and
+DeepSpeed should come only after those two milestones are stable.

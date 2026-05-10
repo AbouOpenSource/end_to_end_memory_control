@@ -1,5 +1,7 @@
 # End-to-End Memory Control
 
+[![CI/CD](https://github.com/AbouOpenSource/end_to_end_memory_control/actions/workflows/ci.yml/badge.svg)](https://github.com/AbouOpenSource/end_to_end_memory_control/actions/workflows/ci.yml)
+
 This is an independent project scaffold for moving from the SimGrid control
 study to a real training-loop experiment. The first target is deliberately small:
 a local PyTorch training loop on synthetic data, running on CPU by default, with

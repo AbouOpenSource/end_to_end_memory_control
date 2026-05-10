@@ -1,0 +1,63 @@
+name: CI/CD
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python-smoke:
+    name: Python smoke tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install CPU dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+
+      - name: Compile Python sources
+        run: |
+          python -m py_compile train_tiny.py model_zoo.py check_run.py run_matrix.py
+
+      - name: Run controller smoke tests
+        run: |
+          python train_tiny.py --config configs/smoke.json --controller static --steps 4 --output out/ci_static.csv
+          python check_run.py out/ci_static.csv
+          python train_tiny.py --config configs/smoke.json --controller headroom --steps 4 --output out/ci_headroom.csv
+          python check_run.py out/ci_headroom.csv
+          python train_tiny.py --config configs/smoke.json --controller safe_greedy --steps 4 --output out/ci_safe_greedy.csv
+          python check_run.py out/ci_safe_greedy.csv
+
+      - name: Run multi-seed matrix
+        run: |
+          python run_matrix.py \
+            --config configs/smoke.json \
+            --controllers static,headroom,safe_greedy \
+            --seeds 0,1 \
+            --steps 3 \
+            --baseline static \
+            --out-dir out/ci_matrix
+
+      - name: Upload telemetry artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: end-to-end-telemetry
+          path: out/
+          if-no-files-found: ignore

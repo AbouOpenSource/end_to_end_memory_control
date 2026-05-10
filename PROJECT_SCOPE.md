@@ -17,3 +17,13 @@ full cluster or framework work:
 The first accepted milestone is a CPU smoke test. The next milestone is a GPU
 single-process run with CUDA memory telemetry. Distributed PyTorch, FSDP, and
 DeepSpeed should come only after those two milestones are stable.
+
+Current completion target for the paper-facing scaffold:
+
+- deterministic baselines: `static`, `headroom`, and `safe_greedy`;
+- checkpoint-backed `rl` policy inference from the sibling `rl_memory_agent`
+  project;
+- per-step telemetry compatible with the paper metrics: throughput, step time,
+  communication/I/O proxy fractions, peak memory, OOM, knob changes;
+- CUDA telemetry when a CUDA device is selected;
+- multi-seed runner with mean +/- 95% confidence intervals.

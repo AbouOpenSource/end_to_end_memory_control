@@ -109,6 +109,11 @@ def _summarize_telemetry(path: Path) -> dict[str, object]:
         "telemetry_csv": str(path),
         "controller": final.get("controller", ""),
         "model_name": final.get("model_name", ""),
+        "dataset_name": final.get("dataset_name", ""),
+        "precision": final.get("precision", ""),
+        "compile_model": final.get("compile_model", ""),
+        "distributed": final.get("distributed", ""),
+        "world_size": final.get("world_size", ""),
         "model_parameters": final.get("model_parameters", ""),
         "model_input_shape": final.get("model_input_shape", ""),
         "memory_source": final.get("memory_source", ""),
@@ -212,6 +217,14 @@ def main() -> None:
     p.add_argument("--baseline", default="static")
     p.add_argument("--steps", type=int, default=None)
     p.add_argument("--device", type=str, default=None)
+    p.add_argument("--dataset", choices=("synthetic", "cifar10"), default=None)
+    p.add_argument("--data-dir", type=str, default=None)
+    p.add_argument("--download-dataset", action="store_true")
+    p.add_argument("--num-workers", type=int, default=None)
+    p.add_argument("--precision", choices=("fp32", "bf16"), default=None)
+    p.add_argument("--compile-model", action="store_true")
+    p.add_argument("--distributed", action="store_true")
+    p.add_argument("--nproc-per-node", type=int, default=None)
     p.add_argument("--budget-mb", type=float, default=None)
     p.add_argument("--rl-checkpoint", type=Path, default=None)
     p.add_argument("--rl-action-profile", choices=("all", "fast_only"), default=None)
@@ -240,8 +253,7 @@ def main() -> None:
     for controller in _parse_csv(args.controllers):
         for seed in _parse_int_csv(args.seeds):
             telemetry = out_dir / f"{controller}__seed{seed}.csv"
-            cmd = [
-                sys.executable,
+            train_args = [
                 str(train_script),
                 "--config",
                 str(config),
@@ -252,6 +264,20 @@ def main() -> None:
                 "--seed",
                 str(seed),
             ]
+            if args.distributed:
+                nproc = int(args.nproc_per_node or 2)
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "torch.distributed.run",
+                    "--standalone",
+                    "--nproc-per-node",
+                    str(nproc),
+                    *train_args,
+                    "--distributed",
+                ]
+            else:
+                cmd = [sys.executable, *train_args]
             if controller == "rl":
                 if rl_checkpoint is None:
                     raise SystemExit("--controllers includes rl, so --rl-checkpoint is required")
@@ -264,6 +290,18 @@ def main() -> None:
                 cmd.extend(["--steps", str(int(args.steps))])
             if args.device is not None:
                 cmd.extend(["--device", str(args.device)])
+            if args.dataset is not None:
+                cmd.extend(["--dataset", str(args.dataset)])
+            if args.data_dir is not None:
+                cmd.extend(["--data-dir", str(args.data_dir)])
+            if args.download_dataset:
+                cmd.append("--download-dataset")
+            if args.num_workers is not None:
+                cmd.extend(["--num-workers", str(int(args.num_workers))])
+            if args.precision is not None:
+                cmd.extend(["--precision", str(args.precision)])
+            if args.compile_model:
+                cmd.append("--compile-model")
             if args.budget_mb is not None:
                 cmd.extend(["--budget-mb", str(float(args.budget_mb))])
             subprocess.run(cmd, cwd=str(script_dir), check=True)

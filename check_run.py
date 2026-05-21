@@ -60,6 +60,8 @@ def main() -> None:
         print(
             "model="
             f"{final.get('model_name')} "
+            f"dataset={final.get('dataset_name', 'unknown')} "
+            f"precision={final.get('precision', 'unknown')} "
             f"params={final.get('model_parameters', 'unknown')} "
             f"input_shape={final.get('model_input_shape', 'unknown')}"
         )

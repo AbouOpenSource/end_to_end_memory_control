@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import json
 import math
+import os
 import random
 import sys
 import time
@@ -25,6 +27,14 @@ class RunConfig:
     num_classes: int = 10
     model_name: str = "mlp"
     model_args: dict[str, Any] = field(default_factory=dict)
+    dataset_name: str = "synthetic"
+    data_dir: str = "data"
+    download_dataset: bool = False
+    num_workers: int = 0
+    pin_memory: bool = True
+    precision: str = "fp32"
+    compile_model: bool = False
+    distributed: bool = False
     initial_micro_batch: int = 16
     initial_grad_accum: int = 1
     max_micro_batch: int = 64
@@ -81,6 +91,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--output", type=Path, default=Path("out/smoke.csv"))
     p.add_argument("--controller", choices=("static", "headroom", "safe_greedy", "rl"), default=None)
     p.add_argument("--model", choices=available_model_names(), default=None, help="Model architecture to instantiate")
+    p.add_argument("--dataset", choices=("synthetic", "cifar10"), default=None, help="Input data source")
+    p.add_argument("--data-dir", type=str, default=None, help="Dataset cache directory")
+    p.add_argument("--download-dataset", action="store_true", help="Download the dataset when needed")
+    p.add_argument("--num-workers", type=int, default=None, help="DataLoader worker count for real datasets")
+    p.add_argument("--precision", choices=("fp32", "bf16"), default=None, help="CUDA autocast precision")
+    p.add_argument("--compile-model", action="store_true", help="Use torch.compile when available")
+    p.add_argument("--distributed", action="store_true", help="Enable single-node torch.distributed/DDP mode")
     p.add_argument(
         "--model-arg",
         action="append",
@@ -132,6 +149,20 @@ def _build_config(args: argparse.Namespace) -> RunConfig:
         cfg = replace(cfg, controller=args.controller)
     if args.model is not None:
         cfg = replace(cfg, model_name=args.model, model_args={})
+    if args.dataset is not None:
+        cfg = replace(cfg, dataset_name=str(args.dataset))
+    if args.data_dir is not None:
+        cfg = replace(cfg, data_dir=str(args.data_dir))
+    if args.download_dataset:
+        cfg = replace(cfg, download_dataset=True)
+    if args.num_workers is not None:
+        cfg = replace(cfg, num_workers=int(args.num_workers))
+    if args.precision is not None:
+        cfg = replace(cfg, precision=str(args.precision))
+    if args.compile_model:
+        cfg = replace(cfg, compile_model=True)
+    if args.distributed:
+        cfg = replace(cfg, distributed=True)
     model_arg_overrides = _parse_model_arg_overrides(args.model_arg)
     if model_arg_overrides:
         cfg = replace(cfg, model_args={**cfg.model_args, **model_arg_overrides})
@@ -153,6 +184,10 @@ def _build_config(args: argparse.Namespace) -> RunConfig:
         raise SystemExit(f"unknown controller={cfg.controller!r}")
     if cfg.controller == "rl" and not cfg.rl_checkpoint:
         raise SystemExit("--controller rl requires --rl-checkpoint or rl_checkpoint in the config")
+    if cfg.dataset_name not in {"synthetic", "cifar10"}:
+        raise SystemExit(f"unknown dataset_name={cfg.dataset_name!r}")
+    if cfg.precision not in {"fp32", "bf16"}:
+        raise SystemExit(f"unknown precision={cfg.precision!r}")
     return cfg
 
 
@@ -168,6 +203,168 @@ def _model_args_for_config(cfg: RunConfig) -> dict[str, Any]:
             args["hidden_dim"] = cfg.hidden_dim
         return args
     return {}
+
+
+class BatchProvider:
+    def next(self, batch_size: int) -> tuple[Any, Any]:
+        raise NotImplementedError
+
+
+class SyntheticBatchProvider(BatchProvider):
+    def __init__(self, profile: Any, device: Any, torch: Any) -> None:
+        self.profile = profile
+        self.device = device
+        self.torch = torch
+
+    def next(self, batch_size: int) -> tuple[Any, Any]:
+        return make_synthetic_batch(self.profile, batch_size, self.device, self.torch)
+
+
+class DataLoaderBatchProvider(BatchProvider):
+    def __init__(self, loader: Any, device: Any, sampler: Any | None = None) -> None:
+        self.loader = loader
+        self.device = device
+        self.sampler = sampler
+        self.epoch = 0
+        self.iterator = self._new_iterator()
+
+    def _new_iterator(self) -> Any:
+        if self.sampler is not None and hasattr(self.sampler, "set_epoch"):
+            self.sampler.set_epoch(self.epoch)
+            self.epoch += 1
+        return iter(self.loader)
+
+    def next(self, batch_size: int) -> tuple[Any, Any]:
+        try:
+            x, y = next(self.iterator)
+        except StopIteration:
+            self.iterator = self._new_iterator()
+            x, y = next(self.iterator)
+        x = x[:batch_size].to(self.device, non_blocking=True)
+        y = y[:batch_size].to(self.device, non_blocking=True)
+        return x, y
+
+
+def _build_batch_provider(
+    cfg: RunConfig,
+    profile: Any,
+    device: Any,
+    torch: Any,
+    *,
+    distributed_rank: int = 0,
+    distributed_world_size: int = 1,
+) -> BatchProvider:
+    if cfg.dataset_name == "synthetic":
+        return SyntheticBatchProvider(profile, device, torch)
+
+    if cfg.dataset_name != "cifar10":
+        raise SystemExit(f"unknown dataset_name={cfg.dataset_name!r}")
+
+    if tuple(profile.input_shape) != (3, 32, 32):
+        raise SystemExit(
+            "dataset_name=cifar10 requires a model profile with input_shape=(3, 32, 32). "
+            "Use model_name=tiny_cnn or add a compatible model_zoo entry."
+        )
+
+    try:
+        from torchvision import datasets, transforms
+    except ImportError as exc:
+        raise SystemExit(
+            "dataset_name=cifar10 requires torchvision. Install cloud dependencies with: "
+            "python -m pip install -r requirements-cloud.txt"
+        ) from exc
+
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
+        ]
+    )
+    dataset = datasets.CIFAR10(
+        root=str(Path(cfg.data_dir).expanduser()),
+        train=True,
+        download=bool(cfg.download_dataset),
+        transform=transform,
+    )
+    generator = torch.Generator()
+    generator.manual_seed(int(cfg.seed))
+    loader_batch_size = max(1, int(cfg.max_micro_batch))
+    sampler = None
+    shuffle = True
+    if distributed_world_size > 1:
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset,
+            num_replicas=int(distributed_world_size),
+            rank=int(distributed_rank),
+            shuffle=True,
+            seed=int(cfg.seed),
+            drop_last=True,
+        )
+        shuffle = False
+    return DataLoaderBatchProvider(
+        torch.utils.data.DataLoader(
+            dataset,
+            batch_size=loader_batch_size,
+            shuffle=shuffle,
+            sampler=sampler,
+            drop_last=True,
+            num_workers=max(0, int(cfg.num_workers)),
+            pin_memory=bool(cfg.pin_memory and device.type == "cuda"),
+            persistent_workers=bool(int(cfg.num_workers) > 0),
+            generator=None if sampler is not None else generator,
+        ),
+        device,
+        sampler=sampler,
+    )
+
+
+def _autocast_context(cfg: RunConfig, device: Any, torch: Any) -> Any:
+    if device.type != "cuda" or cfg.precision == "fp32":
+        return contextlib.nullcontext()
+    return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+
+def _distributed_info(cfg: RunConfig, torch: Any) -> tuple[bool, int, int, int]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    enabled = bool(cfg.distributed or world_size > 1)
+    if not enabled:
+        return False, 0, 0, 1
+
+    if not torch.distributed.is_available():
+        raise SystemExit("torch.distributed is not available in this PyTorch build")
+    if world_size <= 1:
+        raise SystemExit("distributed mode must be launched with torchrun and WORLD_SIZE > 1")
+    return True, rank, local_rank, world_size
+
+
+def _init_distributed(enabled: bool, device: Any, torch: Any) -> None:
+    if not enabled or torch.distributed.is_initialized():
+        return
+    backend = "nccl" if device.type == "cuda" else "gloo"
+    torch.distributed.init_process_group(backend=backend)
+
+
+def _sync_knobs_distributed(
+    *,
+    enabled: bool,
+    rank: int,
+    device: Any,
+    torch: Any,
+    knobs: Knobs,
+    knob_changed: bool,
+) -> tuple[Knobs, bool]:
+    if not enabled:
+        return knobs, knob_changed
+    tensor = torch.tensor(
+        [int(knobs.micro_batch), int(knobs.grad_accum_steps), int(bool(knob_changed))],
+        dtype=torch.int64,
+        device=device,
+    )
+    torch.distributed.broadcast(tensor, src=0)
+    synced = Knobs(int(tensor[0].item()), int(tensor[1].item()))
+    return synced, bool(int(tensor[2].item())) if rank == 0 else synced != knobs
 
 
 def _estimate_peak_mb(*, model_bytes: int, micro_batch: int, activation_units_per_sample: int) -> float:
@@ -457,21 +654,46 @@ def main() -> None:
     except ImportError as exc:
         raise SystemExit("PyTorch is required for this smoke test. Install it with: python -m pip install torch") from exc
 
-    random.seed(cfg.seed)
-    torch.manual_seed(cfg.seed)
+    distributed, rank, local_rank, world_size = _distributed_info(cfg, torch)
 
-    device = torch.device(cfg.device)
+    seed = int(cfg.seed) + rank
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+    if distributed and str(cfg.device).startswith("cuda"):
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device(cfg.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA device requested but torch.cuda.is_available() is false")
     if device.type == "cuda":
         torch.cuda.set_device(device)
         torch.cuda.empty_cache()
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+    _init_distributed(distributed, device, torch)
 
     model, model_profile = build_model(cfg.model_name, _model_args_for_config(cfg), nn)
     model = model.to(device)
+    if cfg.compile_model:
+        if not hasattr(torch, "compile"):
+            raise SystemExit("compile_model=true requires torch.compile support")
+        model = torch.compile(model)
+    if distributed:
+        ddp_kwargs = {"device_ids": [local_rank], "output_device": local_rank} if device.type == "cuda" else {}
+        model = torch.nn.parallel.DistributedDataParallel(model, **ddp_kwargs)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate)
     model_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
     model_parameters = sum(p.numel() for p in model.parameters())
+    batch_provider = _build_batch_provider(
+        cfg,
+        model_profile,
+        device,
+        torch,
+        distributed_rank=rank,
+        distributed_world_size=world_size,
+    )
 
     knobs = Knobs(
         micro_batch=int(cfg.initial_micro_batch),
@@ -479,7 +701,8 @@ def main() -> None:
     )
     controller_state = ControllerState()
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    if rank == 0:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
     fields = [
         "step",
         "samples",
@@ -507,6 +730,12 @@ def main() -> None:
         "safety_allowed",
         "safety_reason",
         "model_name",
+        "dataset_name",
+        "precision",
+        "compile_model",
+        "distributed",
+        "rank",
+        "world_size",
         "model_parameters",
         "model_input_shape",
         "loss",
@@ -514,9 +743,11 @@ def main() -> None:
         "best_safe_throughput",
     ]
 
-    with args.output.open("w", newline="") as f:
+    output_path = args.output if rank == 0 else Path(os.devnull)
+    with output_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
+        if rank == 0:
+            writer.writeheader()
 
         for step in range(cfg.steps):
             step_knobs = knobs
@@ -532,9 +763,10 @@ def main() -> None:
             compute_started = time.perf_counter()
             try:
                 for _ in range(step_knobs.grad_accum_steps):
-                    x, y = make_synthetic_batch(model_profile, step_knobs.micro_batch, device, torch)
-                    logits = model(x)
-                    loss = F.cross_entropy(logits, y) / max(1, step_knobs.grad_accum_steps)
+                    x, y = batch_provider.next(step_knobs.micro_batch)
+                    with _autocast_context(cfg, device, torch):
+                        logits = model(x)
+                        loss = F.cross_entropy(logits, y) / max(1, step_knobs.grad_accum_steps)
                     loss.backward()
                     total_loss += float(loss.detach().cpu()) * max(1, step_knobs.grad_accum_steps)
 
@@ -579,69 +811,97 @@ def main() -> None:
             effective_samples = 0 if oom else step_knobs.micro_batch * step_knobs.grad_accum_steps
             effective_samples_per_s = effective_samples / max(step_s, 1e-12)
             knob_changed = False
+            control_due = bool(oom or (step + 1) % cfg.control_interval == 0)
+            if distributed:
+                control_tensor = torch.tensor([int(control_due)], dtype=torch.int64, device=device)
+                torch.distributed.all_reduce(control_tensor, op=torch.distributed.ReduceOp.MAX)
+                control_due = bool(int(control_tensor.item()))
 
-            if oom or (step + 1) % cfg.control_interval == 0:
-                knobs, knob_changed = _maybe_update_knobs(
-                    cfg=cfg,
-                    knobs=step_knobs,
-                    state=controller_state,
-                    step=step + 1,
-                    peak_mb=peak_mb,
-                    allocated_mb=allocated_mb,
-                    reserved_mb=reserved_mb,
-                    oom=oom,
-                    compute_s=compute_s,
-                    comm_s=comm_s,
-                    io_s=io_s,
-                    step_s=step_s,
-                    comm_frac=comm_frac,
-                    throughput=effective_samples_per_s,
-                    model_bytes=model_bytes,
-                    activation_units_per_sample=model_profile.activation_units_per_sample,
+            if control_due:
+                if rank == 0:
+                    knobs, knob_changed = _maybe_update_knobs(
+                        cfg=cfg,
+                        knobs=step_knobs,
+                        state=controller_state,
+                        step=step + 1,
+                        peak_mb=peak_mb,
+                        allocated_mb=allocated_mb,
+                        reserved_mb=reserved_mb,
+                        oom=oom,
+                        compute_s=compute_s,
+                        comm_s=comm_s,
+                        io_s=io_s,
+                        step_s=step_s,
+                        comm_frac=comm_frac,
+                        throughput=effective_samples_per_s,
+                        model_bytes=model_bytes,
+                        activation_units_per_sample=model_profile.activation_units_per_sample,
+                    )
+                knobs, knob_changed = _sync_knobs_distributed(
+                    enabled=distributed,
+                    rank=rank,
+                    device=device,
+                    torch=torch,
+                    knobs=knobs,
+                    knob_changed=knob_changed,
                 )
 
-            writer.writerow(
-                {
-                    "step": step + 1,
-                    "samples": effective_samples,
-                    "step_s": f"{step_s:.8f}",
-                    "compute_s": f"{compute_s:.8f}",
-                    "comm_s": f"{comm_s:.8f}",
-                    "io_s": f"{io_s:.8f}",
-                    "comm_frac": f"{comm_frac:.8f}",
-                    "io_frac": f"{io_frac:.8f}",
-                    "peak_mb": f"{peak_mb:.4f}",
-                    "proxy_peak_mb": f"{proxy_peak_mb:.4f}",
-                    "cuda_peak_allocated_mb": f"{cuda_peak_allocated_mb:.4f}",
-                    "cuda_peak_reserved_mb": f"{cuda_peak_reserved_mb:.4f}",
-                    "memory_source": memory_source,
-                    "budget_mb": f"{cfg.budget_mb:.4f}",
-                    "safe_limit_mb": f"{cfg.budget_mb * (1.0 - cfg.headroom_margin):.4f}",
-                    "oom": int(oom),
-                    "micro_batch": step_knobs.micro_batch,
-                    "grad_accum_steps": step_knobs.grad_accum_steps,
-                    "next_micro_batch": knobs.micro_batch,
-                    "next_grad_accum_steps": knobs.grad_accum_steps,
-                    "controller": cfg.controller,
-                    "knob_changed": int(knob_changed),
-                    "controller_action": controller_state.last_action_name,
-                    "safety_allowed": int(controller_state.last_safety_allowed),
-                    "safety_reason": controller_state.last_safety_reason,
-                    "model_name": model_profile.name,
-                    "model_parameters": model_parameters,
-                    "model_input_shape": "x".join(str(dim) for dim in model_profile.input_shape),
-                    "loss": f"{total_loss:.6f}" if math.isfinite(total_loss) else "nan",
-                    "effective_samples_per_s": f"{effective_samples_per_s:.8f}",
-                    "best_safe_throughput": f"{controller_state.best_throughput:.8f}",
-                }
-            )
+            if rank == 0:
+                writer.writerow(
+                    {
+                        "step": step + 1,
+                        "samples": effective_samples,
+                        "step_s": f"{step_s:.8f}",
+                        "compute_s": f"{compute_s:.8f}",
+                        "comm_s": f"{comm_s:.8f}",
+                        "io_s": f"{io_s:.8f}",
+                        "comm_frac": f"{comm_frac:.8f}",
+                        "io_frac": f"{io_frac:.8f}",
+                        "peak_mb": f"{peak_mb:.4f}",
+                        "proxy_peak_mb": f"{proxy_peak_mb:.4f}",
+                        "cuda_peak_allocated_mb": f"{cuda_peak_allocated_mb:.4f}",
+                        "cuda_peak_reserved_mb": f"{cuda_peak_reserved_mb:.4f}",
+                        "memory_source": memory_source,
+                        "budget_mb": f"{cfg.budget_mb:.4f}",
+                        "safe_limit_mb": f"{cfg.budget_mb * (1.0 - cfg.headroom_margin):.4f}",
+                        "oom": int(oom),
+                        "micro_batch": step_knobs.micro_batch,
+                        "grad_accum_steps": step_knobs.grad_accum_steps,
+                        "next_micro_batch": knobs.micro_batch,
+                        "next_grad_accum_steps": knobs.grad_accum_steps,
+                        "controller": cfg.controller,
+                        "knob_changed": int(knob_changed),
+                        "controller_action": controller_state.last_action_name,
+                        "safety_allowed": int(controller_state.last_safety_allowed),
+                        "safety_reason": controller_state.last_safety_reason,
+                        "model_name": model_profile.name,
+                        "dataset_name": cfg.dataset_name,
+                        "precision": cfg.precision,
+                        "compile_model": int(bool(cfg.compile_model)),
+                        "distributed": int(bool(distributed)),
+                        "rank": rank,
+                        "world_size": world_size,
+                        "model_parameters": model_parameters,
+                        "model_input_shape": "x".join(str(dim) for dim in model_profile.input_shape),
+                        "loss": f"{total_loss:.6f}" if math.isfinite(total_loss) else "nan",
+                        "effective_samples_per_s": f"{effective_samples_per_s:.8f}",
+                        "best_safe_throughput": f"{controller_state.best_throughput:.8f}",
+                    }
+                )
 
-    print(f"wrote {args.output}")
-    print(
-        "model="
-        f"{model_profile.name} params={model_parameters} "
-        f"input_shape={model_profile.input_shape} description={model_profile.description}"
-    )
+    if distributed and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
+
+    if rank == 0:
+        print(f"wrote {args.output}")
+        print(
+            "model="
+            f"{model_profile.name} params={model_parameters} "
+            f"dataset={cfg.dataset_name} precision={cfg.precision} "
+            f"distributed={int(bool(distributed))} world_size={world_size} "
+            f"input_shape={model_profile.input_shape} description={model_profile.description}"
+        )
 
 
 if __name__ == "__main__":

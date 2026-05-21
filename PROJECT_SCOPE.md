@@ -18,6 +18,16 @@ The first accepted milestone is a CPU smoke test. The next milestone is a GPU
 single-process run with CUDA memory telemetry. Distributed PyTorch, FSDP, and
 DeepSpeed should come only after those two milestones are stable.
 
+The validation scaffold now includes the code needed to run the GPU milestone
+outside this local machine:
+
+- CIFAR-10 as a real dataset path behind the same training-loop interface;
+- CUDA/bf16 validation configurations;
+- optional single-node DDP execution through `torchrun`;
+- cloud orchestration with `cloud_validate.py`;
+- Markdown report and plots through `summarize_validation.py`;
+- CPU contract tests that keep the validation outputs stable.
+
 Current completion target for the paper-facing scaffold:
 
 - deterministic baselines: `static`, `headroom`, and `safe_greedy`;

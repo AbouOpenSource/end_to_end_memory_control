@@ -1,0 +1,27 @@
+{
+  "steps": 300,
+  "seed": 0,
+  "device": "cuda",
+  "dataset_name": "cifar10",
+  "data_dir": "data",
+  "download_dataset": false,
+  "num_workers": 4,
+  "pin_memory": true,
+  "model_name": "tiny_cnn",
+  "model_args": {
+    "channels": 3,
+    "image_size": 32,
+    "width": 96,
+    "num_classes": 10
+  },
+  "initial_micro_batch": 128,
+  "initial_grad_accum": 1,
+  "max_micro_batch": 768,
+  "max_grad_accum": 32,
+  "control_interval": 5,
+  "budget_mb": 1024.0,
+  "headroom_margin": 0.05,
+  "learning_rate": 0.001,
+  "precision": "bf16",
+  "controller": "safe_greedy"
+}

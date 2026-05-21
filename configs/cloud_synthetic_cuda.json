@@ -1,0 +1,23 @@
+{
+  "steps": 200,
+  "seed": 0,
+  "device": "cuda",
+  "dataset_name": "synthetic",
+  "model_name": "mlp",
+  "model_args": {
+    "input_dim": 2048,
+    "hidden_dim": 4096,
+    "hidden_layers": 4,
+    "num_classes": 100
+  },
+  "initial_micro_batch": 32,
+  "initial_grad_accum": 1,
+  "max_micro_batch": 256,
+  "max_grad_accum": 32,
+  "control_interval": 10,
+  "budget_mb": 4096.0,
+  "headroom_margin": 0.05,
+  "learning_rate": 0.0005,
+  "precision": "bf16",
+  "controller": "safe_greedy"
+}

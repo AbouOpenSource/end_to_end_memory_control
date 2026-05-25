@@ -18,8 +18,16 @@ contract:
 
 ## Files
 
-- `train_tiny.py`: PyTorch training loop with synthetic/CIFAR-10 inputs,
-  `static`, `headroom`, `safe_greedy`, and checkpoint-backed `rl` controllers.
+- `train_tiny.py`: stable CLI entry point for one controller/seed run.
+- `memory_control/cli.py`: command-line parsing and configuration assembly.
+- `memory_control/core/config.py`: `RunConfig` and config/override handling.
+- `memory_control/core/trainer.py`: PyTorch training loop and per-step control
+  integration.
+- `memory_control/controllers/adaptive.py`: `headroom`, `safe_greedy`, and
+  checkpoint-backed `rl` controller decisions.
+- `memory_control/io/batches.py`: synthetic and CIFAR-10 batch providers.
+- `memory_control/io/telemetry.py`: telemetry schema and CSV row formatting.
+- `memory_control/runtime/`: PyTorch autocast/OOM and distributed helper code.
 - `model_zoo.py`: interchangeable model registry used by the training loop.
 - `check_run.py`: small CSV checker that reports throughput, OOM rate, memory
   proxy, and final knobs.
@@ -44,26 +52,23 @@ telemetry, and controllers can only change knobs at safe control points.
 configs/*.json
     |
     v
-train_tiny.py
+train_tiny.py -> memory_control.cli
     |
-    +-- data path
-    |     +-- synthetic batches
-    |     +-- CIFAR-10 through torchvision
+    +-- core
+    |     +-- config.py
+    |     +-- trainer.py
+    |     +-- memory.py
     |
-    +-- model path
-    |     +-- model_zoo.py
-    |     +-- linear / mlp / tiny_cnn
+    +-- io
+    |     +-- batches.py
+    |     +-- telemetry.py
     |
-    +-- control path
-    |     +-- static
-    |     +-- headroom
-    |     +-- safe_greedy
-    |     +-- rl checkpoint from ../rl_memory_agent
+    +-- controllers
+    |     +-- adaptive.py
     |
-    +-- execution path
-    |     +-- CPU smoke test
-    |     +-- single-GPU CUDA
-    |     +-- optional single-node DDP through torchrun
+    +-- runtime
+    |     +-- torch_utils.py
+    |     +-- distributed.py
     |
     v
 per-step telemetry CSV
@@ -77,19 +82,22 @@ summary.csv / aggregate_ci.csv / speedup_ci.csv / validation_report.md
 
 ### Runtime Components
 
-- `RunConfig` in `train_tiny.py` is the central experiment contract. It defines
-  the model, dataset, device, precision, memory budget, controller, and RL
-  checkpoint settings.
+- `RunConfig` in `memory_control/core/config.py` is the central experiment
+  contract. It defines the model, dataset, device, precision, memory budget,
+  controller, and RL checkpoint settings.
 - `model_zoo.py` isolates model construction from the training loop. New
   architectures are added by registering a builder that returns a model and a
   `ModelProfile`.
-- Batch providers isolate the data source. Synthetic data is used for fast CPU
-  and CUDA smoke tests; CIFAR-10 is used for the first real dataset validation.
+- Batch providers in `memory_control/io/batches.py` isolate the data source.
+  Synthetic data is used for fast CPU and CUDA smoke tests; CIFAR-10 is used
+  for the first real dataset validation.
 - Controllers operate only on fast knobs: `micro_batch` and
-  `grad_accum_steps`. The RL controller reuses the policy implementation from
-  the sibling `rl_memory_agent` project.
+  `grad_accum_steps`. `memory_control/controllers/adaptive.py` holds the
+  deterministic policies and RL policy adapter. The RL controller reuses the
+  implementation from the sibling `rl_memory_agent` project.
 - The telemetry CSV is the boundary between training and analysis. Downstream
-  scripts do not inspect Python objects; they only consume CSV metrics.
+  scripts do not inspect Python objects; they only consume CSV metrics emitted
+  through `memory_control/io/telemetry.py`.
 
 ### Validation Layers
 
